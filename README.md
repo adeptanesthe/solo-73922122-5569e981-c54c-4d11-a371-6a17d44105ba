@@ -79,6 +79,60 @@ uvicorn app.main:app --port 8000
 - `GET /stats`:篇数、平均长度、词项数、BM25 参数。
 - `GET /healthz`:健康检查。
 
+## 步骤共识
+
+维修主管可把若干维修单的实际操作顺序登记为一组,服务求出违反票数最少的统一排障顺序。
+
+### `POST /consensus/register` — 整组登记
+
+```json
+{
+  "steps": ["断电", "放油", "换滤芯", "加油", "试机"],
+  "records": [
+    {"id": "R0001", "order": ["断电", "放油", "换滤芯"]},
+    {"id": "R0002", "order": ["放油", "断电", "换滤芯"]}
+  ]
+}
+```
+
+- `steps`:2~8 个步骤词,即完整顺序的取值域,不得重复。
+- `records`:至多 30 条现存记录,每条至少两步;顺序中的步骤词必须属于本次 `steps`,
+  且必须出现在该记录的分词中。
+- 每条有效记录对自身顺序中出现的每一对步骤各投一票(靠前者先于靠后者),
+  在全部排列中取违反票数最少者;同票数取字典序最小者。
+- 编号不存在、编号或步骤重复、步骤词不属于记录分词、步骤数/记录数越界时整组拒绝
+  (返回 `422`,`detail` 含 `code` 与 `message`),旧登记保持可用。
+
+响应:
+
+```json
+{
+  "status": "ok",
+  "order": ["断电", "放油", "换滤芯", "加油", "试机"],
+  "conflicts": 1,
+  "records": [
+    {"id": "R0001", "pairs": []},
+    {"id": "R0002", "pairs": [["放油", "断电"]]}
+  ],
+  "valid_records": 2
+}
+```
+
+- `conflicts`:最少违反票数;`records[].pairs`:该记录中与最终顺序相反的步骤对
+  (按记录内先后排列);`valid_records`:参与计算的有效记录数。
+- 已无有效记录(或从未登记)时 `status` 为 `insufficient_evidence`,`order`、
+  `records` 为空,`conflicts` 为 0。
+
+### `GET /consensus` — 按当前语料重算
+
+- 登记时记录每篇文档的版本号。记录被更正或删除后版本号改变,旧登记中的该条永久失效;
+  删除后以同一编号重新录入也会得到新版本号,**旧顺序不会恢复**。
+- 后续查询只统计仍然有效的记录;同组内的记录保持不变,直到下一次成功登记整组替换。
+- 登记与更正共用同一把写锁、同一个不可变 `State` 快照:登记记录下当时的文档版本,
+  计算只使用同一版语料与相容的整组顺序,不会出现"旧语料校验、新语料计算"的撕裂。
+- 更正失败(如超过 5000 篇返回 `409`)时语料与共识结论都保持原状。
+- 检索不受共识登记影响,`/search`、`/search/exhaustive` 始终可用。
+
 ## 剪枝正确性说明
 
 每个词项的 posting 按 32 篇分块,预计算块内最大贡献;块最大贡献的后缀最大值即
@@ -90,7 +144,7 @@ uvicorn app.main:app --port 8000
 ## 验证
 
 ```bash
-python3 -m pytest tests/ -q     # 23 项单元/API/并发测试
+python3 -m pytest tests/ -q     # 46 项单元/API/并发/共识测试
 python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 ```
 
@@ -107,6 +161,7 @@ python3 scripts/verify.py       # 穷举对照 + 随机回归 + 剪枝示例
 
 ```
 app/index.py      BM25 状态构建、BlockMax WAND、穷举对照、原子状态管理
+app/consensus.py  步骤共识:登记校验、记录失效、最少违反顺序求解
 app/main.py       FastAPI 应用与端点
 app/schemas.py    请求/响应模型
 data/corpus.json  本地示例语料(scripts/gen_corpus.py 生成,确定性种子)

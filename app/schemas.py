@@ -40,3 +40,38 @@ class Hit(BaseModel):
 class SearchResponse(BaseModel):
     hits: list[Hit]
     scored: int = Field(description="完整计分篇数")
+
+
+class ConsensusRecord(BaseModel):
+    """登记中的一条记录:编号与该记录实际执行的部分步骤顺序。"""
+
+    id: str = Field(min_length=1, max_length=128, description="现存维修记录编号")
+    order: list[str] = Field(
+        min_length=2, description="该记录实际执行的步骤顺序,至少两步"
+    )
+
+
+class ConsensusRegisterRequest(BaseModel):
+    """整组登记:2~8 个步骤词 + 至多 30 条现存记录。"""
+
+    steps: list[str] = Field(
+        min_length=2, max_length=8, description="步骤词(顺序取值域),不得重复"
+    )
+    records: list[ConsensusRecord] = Field(
+        max_length=30, description="现存记录编号与各自部分步骤顺序,至多 30 条"
+    )
+
+
+class RecordConflicts(BaseModel):
+    id: str
+    pairs: list[list[str]] = Field(
+        description="该记录中与最终完整顺序相反的步骤对,按记录内先后排列"
+    )
+
+
+class ConsensusResponse(BaseModel):
+    status: str = Field(description="ok 或 insufficient_evidence")
+    order: list[str] = Field(description="违反票数最少的完整顺序;证据不足时为空")
+    conflicts: int = Field(description="最少违反票数")
+    records: list[RecordConflicts] = Field(description="各有效记录的冲突步骤对")
+    valid_records: int = Field(description="参与计算的有效记录数")

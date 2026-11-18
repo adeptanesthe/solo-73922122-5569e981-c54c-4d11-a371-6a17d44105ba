@@ -13,10 +13,12 @@ from __future__ import annotations
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 import numpy as np
+
+from .consensus import Registration, build_registration, compute_consensus
 
 K1 = 1.2
 B = 0.75
@@ -41,9 +43,11 @@ class TermData:
 
 @dataclass(frozen=True)
 class State:
-    """一次完整生效的不可变检索状态:语料 + 全库统计 + 剪枝依据。
+    """一次完整生效的不可变检索状态:语料 + 全库统计 + 剪枝依据 + 步骤共识登记。
 
     构建完成后任何字段都不再修改;查询全程持有同一引用即保证一致性。
+    语料与共识登记在同一 State 中一起切换:一次共识计算只会看到同一版语料,
+    以及登记中与之相容的整组记录。
     """
 
     docs: dict  # 编号 -> (正文, 分词序列 tuple);按约定不再修改
@@ -52,9 +56,17 @@ class State:
     n: int  # 总篇数 N(空文档计入)
     avgdl: float  # 平均文档长度(空文档按 0 计入)
     terms: dict  # 词项 -> TermData
+    doc_versions: dict  # 编号 -> 文档版本号(每次增改/删除递增,用于判定旧登记失效)
+    version: int  # 语料版本号(每次成功批量更正递增)
+    registration: Registration | None  # 当前整组步骤共识登记
 
 
-def build_state(docs: dict) -> State:
+def build_state(
+    docs: dict,
+    doc_versions: dict | None = None,
+    version: int = 0,
+    registration: Registration | None = None,
+) -> State:
     """由 {编号: (正文, 分词序列)} 构建完整状态。空文档计入 N 与平均长度。"""
     ids = tuple(sorted(docs.keys()))
     n = len(ids)
@@ -95,7 +107,20 @@ def build_state(docs: dict) -> State:
             docids=docids, contribs=contribs, block_last=block_last, suffix_max=suffix_max
         )
 
-    return State(docs=docs, ids=ids, texts=texts, n=n, avgdl=avgdl, terms=terms)
+    return State(
+        docs=docs,
+        ids=ids,
+        texts=texts,
+        n=n,
+        avgdl=avgdl,
+        terms=terms,
+        # 未提供版本表时,当前所有文档视为版本 0(直接 build_state 的场景)
+        doc_versions=(
+            dict(doc_versions) if doc_versions is not None else {i: 0 for i in ids}
+        ),
+        version=version,
+        registration=registration,
+    )
 
 
 class _Cursor:
@@ -245,22 +270,62 @@ class IndexManager:
 
         同一批内先删后增改;增改中重复编号后者覆盖前者。
         成功返回 (新 State, 实际删除篇数);失败抛异常,当前状态不变。
+        每篇被增改/删除的记录版本号递增,旧登记中的对应记录随之失效;
+        既有共识登记整组保留,但计算时只统计仍然有效的记录。
         """
         with self._lock:
             docs = dict(self._state.docs)
+            doc_versions = dict(self._state.doc_versions)
+            version = self._state.version + 1
             deleted = 0
             for did in deletes:
                 if docs.pop(did, None) is not None:
                     deleted += 1
+                    doc_versions[did] = version  # 删除也换版本,同号重录不恢复旧证据
             for did, text, tokens in upserts:
                 docs[did] = (text, tuple(tokens))
+                doc_versions[did] = version
             if len(docs) > MAX_DOCS:
                 raise CapacityError(f"更正后总篇数 {len(docs)} 超过上限 {MAX_DOCS},本批未生效")
-            new_state = self._build(docs)
+            new_state = self._build(
+                docs,
+                doc_versions=doc_versions,
+                version=version,
+                registration=self._state.registration,
+            )
             self._state = new_state  # 原子切换:之后的新查询使用新状态
             return new_state, deleted
 
-    def _build(self, docs: dict) -> State:
+    def register_consensus(self, steps: list, records: list) -> State:
+        """整组登记步骤共识。任一条记录不合法则整组拒绝,旧登记与语料均不变。
+
+        校验与登记在同一把写锁内基于同一 State 快照完成,记录下每篇文档的版本号,
+        因此不会出现"用旧语料校验、贴到新语料上"的错配。
+        """
+        with self._lock:
+            state = self._state
+            registration = build_registration(steps, records, state)
+            # 登记不改变检索结构,复制不可变 State 仅替换登记引用。
+            self._state = replace(state, registration=registration)
+            return self._state
+
+    def consensus(self):
+        """按当前 State 快照计算共识;语料与登记来自同一版本。"""
+        state = self._state  # 只读一次:即使并发切换,也始终用同一个完整快照
+        return compute_consensus(state.registration, state)
+
+    def _build(
+        self,
+        docs: dict,
+        doc_versions: dict | None = None,
+        version: int = 0,
+        registration: Registration | None = None,
+    ) -> State:
         if self._build_delay > 0:
             time.sleep(self._build_delay)  # 慢建索引:占写锁但不挡读者
-        return build_state(docs)
+        return build_state(
+            docs,
+            doc_versions=doc_versions,
+            version=version,
+            registration=registration,
+        )
